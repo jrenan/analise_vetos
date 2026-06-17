@@ -4,7 +4,7 @@ Objetivo:
 - Mostrar lista de vetos já extraídos
 - Exibir classificação sugerida (motivos_ids/justificativa)
 - Permitir revisão e correção por uma colega de direito
-- Salvar decisões em uma planilha Google Sheets (ou CSV de fallback)
+- Salvar decisões em CSV local a medida que a revisão é feita
 """
 
 from __future__ import annotations
@@ -13,17 +13,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
-import json
 import os
 import pandas as pd
 import streamlit as st
-
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-except Exception:
-    gspread = None
-    Credentials = None
 
 
 CATEGORY_LABELS: Dict[int, str] = {
@@ -116,123 +108,17 @@ def normalize_csv_path(name: str) -> str:
     return get_secret(name, name)
 
 
-def a1_column_letter(n: int) -> str:
-    letters = ""
-    while n > 0:
-        n, rem = divmod(n - 1, 26)
-        letters = chr(65 + rem) + letters
-    return letters
-
-
-def read_service_account_info():
-    candidates = [
-        "GOOGLE_SERVICE_ACCOUNT",
-        "GOOGLE_SERVICE_ACCOUNT_JSON",
-        "SERVICE_ACCOUNT_INFO",
-        "GOOGLE_SERVICE_ACCOUNT_INFO",
-    ]
-    for key in candidates:
-        if key in st.secrets:
-            raw = st.secrets[key]
-            if isinstance(raw, dict):
-                return dict(raw)
-            if isinstance(raw, str):
-                try:
-                    return json.loads(raw)
-                except Exception:
-                    pass
-    if "google_service_account" in st.secrets and isinstance(
-        st.secrets["google_service_account"], dict
-    ):
-        return dict(st.secrets["google_service_account"])
-    return None
-
-
-def initialize_google_sheet():
-    """Retorna (worksheet, mensagem, ativo)."""
-    if gspread is None or Credentials is None:
-        return None, "Dependências Google Sheet não instaladas. Use CSV local (fallback).", False
-
-    sheet_id = get_secret("GOOGLE_SHEET_ID", "")
-    sheet_url = get_secret("GOOGLE_SHEET_URL", "")
-    sheet_name = get_secret("GOOGLE_SHEET_NAME", "revisoes_vetos")
-    service_info = read_service_account_info()
-    if not service_info:
-        return None, "Google Service Account não informado no secrets.", False
-    if not sheet_id and not sheet_url:
-        return None, "Defina GOOGLE_SHEET_ID ou GOOGLE_SHEET_URL no secrets.", False
-
-    try:
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = Credentials.from_service_account_info(service_info, scopes=scopes)
-        gc = gspread.authorize(creds)
-        spreadsheet = gc.open_by_key(sheet_id) if sheet_id else gc.open_by_url(sheet_url)
-        try:
-            ws = spreadsheet.worksheet(sheet_name)
-        except Exception:
-            ws = spreadsheet.add_worksheet(title=sheet_name, rows=2000, cols=len(REVIEW_COLUMNS))
-            ws.append_row(REVIEW_COLUMNS, value_input_option="RAW")
-
-        values = ws.get_all_values()
-        if not values:
-            ws.append_row(REVIEW_COLUMNS, value_input_option="RAW")
-        else:
-            header = [h.strip() for h in values[0]]
-            if "uid" not in header:
-                ws.insert_row(REVIEW_COLUMNS, 1)
-            else:
-                # Corrige colunas faltantes na linha de cabeçalho preservando ordem principal.
-                if any(col not in header for col in REVIEW_COLUMNS):
-                    ws.update(f"A1:{a1_column_letter(len(REVIEW_COLUMNS))}1", [REVIEW_COLUMNS])
-
-        return ws, "Conectado ao Google Sheets com sucesso.", True
-    except Exception as e:
-        return None, f"Falha ao conectar planilha: {e}", False
-
-
-def read_reviews_from_sheet(worksheet) -> pd.DataFrame:
-    if worksheet is None:
-        return pd.DataFrame(columns=REVIEW_COLUMNS)
-    values = worksheet.get_all_values()
-    if not values:
-        return pd.DataFrame(columns=REVIEW_COLUMNS)
-    header = [c.strip() for c in values[0]]
-    rows = values[1:]
-    if not rows:
-        return pd.DataFrame(columns=header if header else REVIEW_COLUMNS)
-    df = pd.DataFrame(rows, columns=header).fillna("")
-    for col in REVIEW_COLUMNS:
-        if col not in df.columns:
-            df[col] = ""
-    df = df[REVIEW_COLUMNS]
-    return df
-
-
-def upsert_review_in_sheet(worksheet, row_payload: Dict[str, str]) -> bool:
-    if worksheet is None:
-        return False
-    values = worksheet.get_all_values()
-    if not values:
-        return False
-    header = [h.strip() for h in values[0]]
-    if "uid" not in header:
-        return False
-    uid_index = header.index("uid")
-    target_row = len(values) + 1
-    uid_target = str(row_payload.get("uid", ""))
-    for i, row in enumerate(values[1:], start=2):
-        if uid_index < len(row) and row[uid_index] == uid_target:
-            target_row = i
-            break
-
-    row_values = [str(row_payload.get(col, "")) for col in REVIEW_COLUMNS]
-    final_col = a1_column_letter(len(REVIEW_COLUMNS))
-    worksheet.update(
-        f"A{target_row}:{final_col}{target_row}",
-        [row_values],
-        value_input_option="RAW",
-    )
-    return True
+def resolve_revisor_csv_path(base_path: str, revisor: str) -> str:
+    base_path = (base_path or "revisoes_vetos.csv").strip()
+    if not base_path.lower().endswith(".csv"):
+        base_path = base_path + ".csv"
+    revisor = (revisor or "").strip().lower()
+    if not revisor:
+        return base_path
+    clean = revisor.replace(" ", "_")
+    clean = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in clean)
+    base, ext = os.path.splitext(base_path)
+    return f"{base}_{clean}{ext}"
 
 
 def load_reviews_from_csv(path: str) -> pd.DataFrame:
@@ -315,29 +201,35 @@ def build_display_table(df: pd.DataFrame) -> pd.DataFrame:
 def main() -> None:
     st.set_page_config(page_title="Revisão de Classificação dos Vetos", layout="wide")
     st.title("Revisão de classificações dos vetos")
-    st.caption(
-        "Interface de validação jurídica para ajustar as categorias dos vetos."
-    )
+    st.caption("Interface de validação jurídica para ajustar as categorias dos vetos.")
 
     if not apply_password_gate():
         st.stop()
 
-    # Base de dados (pode ser CSV consolidado local)
+    # Base de dados e arquivo de revisão (CSV local)
     base_path = normalize_csv_path("BASE_VETOS_CSV")
-    review_csv_path = normalize_csv_path("REVISOES_CSV")
+    review_base_name = normalize_csv_path("REVISOES_CSV")
+    if not review_base_name:
+        review_base_name = "revisoes_vetos.csv"
 
-    # Tenta backend Sheets primeiro
-    worksheet, backend_msg, use_sheet = initialize_google_sheet()
-    st.sidebar.markdown(f"**Backend de revisão:** {'Google Sheets' if use_sheet else 'CSV local'}")
-    st.sidebar.caption(backend_msg)
+    st.sidebar.header("Arquivo de revisão da pessoa")
+    reviewer_name = st.sidebar.text_input("Seu nome (opcional)")
+    review_csv_path = resolve_revisor_csv_path(review_base_name, reviewer_name)
+    st.sidebar.caption(f"Arquivo da revisão desta sessão: `{review_csv_path}`")
+    if st.sidebar.button("Limpar revisão local", type="secondary"):
+        if os.path.exists(review_csv_path):
+            os.remove(review_csv_path)
+            st.success("Arquivo de revisão local removido.")
+            st.rerun()
+        else:
+            st.info("Não havia arquivo para limpar.")
+    st.sidebar.caption(
+        "A revisão será gravada no CSV toda vez que você clicar em 'Salvar revisão'. "
+        "Você pode baixar o arquivo ao final para enviar."
+    )
 
     base_df = load_data(base_path)
-
-    if use_sheet:
-        reviews_df = read_reviews_from_sheet(worksheet)
-    else:
-        reviews_df = load_reviews_from_csv(review_csv_path)
-
+    reviews_df = load_reviews_from_csv(review_csv_path)
     merged = merge_sources(base_df, reviews_df)
 
     st.sidebar.header("Filtros")
@@ -396,7 +288,7 @@ def main() -> None:
 
     st.subheader("Fila de revisão")
     tabela = build_display_table(candidato).copy()
-    st.dataframe(tabela)
+    st.dataframe(tabela, use_container_width=True)
 
     st.markdown("---")
     st.subheader("Detalhe do veto selecionado")
@@ -445,9 +337,9 @@ def main() -> None:
         st.write(selected_row.get("justificativa", "Sem justificativa automática."))
 
     st.markdown("### Minha revisão")
-    suggested = parse_motivos_ids(selected_row.get("motivos_ids", ""))
     current = parse_motivos_ids(selected_row.get("revisao_motivos_ids", ""))
-    current = current or suggested
+    if not current:
+        current = parse_motivos_ids(selected_row.get("motivos_ids", ""))
 
     with st.form("form_revisao", clear_on_submit=False):
         novos_motivos = st.multiselect(
@@ -478,7 +370,7 @@ def main() -> None:
         )
         revisor = st.text_input(
             "Quem revisou",
-            value=selected_row.get("revisor", ""),
+            value=selected_row.get("revisor", reviewer_name),
             placeholder="Ex.: Maria Souza",
         )
 
@@ -497,35 +389,22 @@ def main() -> None:
                     "atualizado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }
 
-                if use_sheet and worksheet is not None:
-                    ok = upsert_review_in_sheet(worksheet, review_payload)
-                    if ok:
-                        st.success("Revisão salva no Google Sheets.")
-                    else:
-                        st.error("Não foi possível salvar no Google Sheets. Ajuste sua configuração.")
-                else:
-                    existing = reviews_df
-                    if "uid" not in existing.columns:
-                        existing = pd.DataFrame(columns=REVIEW_COLUMNS)
-                    existing = existing[existing["uid"] != selected_uid]
-                    existing = pd.concat(
-                        [existing, pd.DataFrame([review_payload])], ignore_index=True
-                    )
-                    save_reviews_to_csv(review_csv_path, existing)
-                    st.success("Revisão salva em CSV local.")
+                existing = reviews_df
+                if "uid" not in existing.columns:
+                    existing = pd.DataFrame(columns=REVIEW_COLUMNS)
+                existing = existing[existing["uid"] != selected_uid]
+                existing = pd.concat([existing, pd.DataFrame([review_payload])], ignore_index=True)
+                save_reviews_to_csv(review_csv_path, existing)
+                st.success(f"Revisão salva em `{review_csv_path}`.")
                 st.rerun()
 
     st.markdown("---")
     st.subheader("Exportar revisão")
-    reviews_final = (
-        read_reviews_from_sheet(worksheet)
-        if use_sheet
-        else load_reviews_from_csv(review_csv_path)
-    )
+    reviews_final = load_reviews_from_csv(review_csv_path)
     st.download_button(
         "Baixar arquivo de revisões",
         data=reviews_final.to_csv(index=False).encode("utf-8"),
-        file_name="revisoes_vetos.csv",
+        file_name=Path(review_csv_path).name,
         mime="text/csv",
     )
 
@@ -535,4 +414,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
